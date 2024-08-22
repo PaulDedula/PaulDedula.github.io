@@ -1,0 +1,87 @@
+---
+layout: post
+title:  "Finding the Complete Windows Version String"
+date:   2024-08-20 00:00:00 -0500
+categories: powershell
+---
+
+# Overview
+
+Recently, we had a need to manually gather the full windows build version from several thousand endpoints. No problem, that's what Intune and our RMM database is for. Oh, but wait, the "update build revision" isn't populated for our non-intune managed fleet in the RMM db. 
+
+
+# The Rabit Hole
+
+We started off by reviewing our understanding of where this information comes from within the OS. What we found was that the commonly referenced dotnet classes and PowerShell commands to manually harvest this data were either: a) missing the UBR entirely or b) referencing the version of something completely separate to the OS Version.
+
+Specifically, many sources were citing `[System.Environment]::osversion` and `(get-computerinfo).oshardwareabstractionlayer`. Let's take a look at the output and see why we can't use these. For a source of truth, we are going to be referencing the output of the "winver" utility and the traditional "ver" command.
+
+
+{% highlight powershell %}
+
+# Here is the output of "ver"
+cmd.exe /c ver
+Microsoft Windows [Version 10.0.22631.4037]
+
+# .Net OS Version
+# We can see that under 'revision', the UBR is missing
+[System.Environment]::OSVersion.Version
+Major  Minor  Build  Revision
+-----  -----  -----  --------
+10     0      22631  0
+
+# Native PowerShell command 
+# This has *a* revision number, but this is just the file version of HAL.dll. 
+# This does not match up to our reference from winver.exe or ver.
+# Nor does it match up to the build value returned by [System.Environment]::OSVersion.version. 
+(Get-ComputerInfo).OsHardwareAbstractionLayer
+10.0.22621.2506
+
+# Expanding on Get-ComputerInfo some more.
+# It, effectively, is doing the following in the background.
+# This is obviously useful if you're looking for the hal.dll version, however the output is commonly mistaken 
+# for the windows build version.
+$path = "C:\windows\system32\hal.dll" -Replace "\\","\\"
+(get-cimInstance -Class Cim_DataFile -Filter "Name='$path'").Version
+Version    : 10.0.22621.2506
+
+# What about the WMI Win32_OperatingSystem Class? Nope.
+# This is again missing the UBR.
+(Get-CIMInstance Win32_operatingsystem).Version
+10.0.22631
+
+{% endhighlight %}
+
+So what is the deal with winver.exe and ver then? Where do those programs get the proper information from? Somewhat underwhelmingly, they get it from the registry. A procmon trace showed that ver was reading a few values and seemingly just concatenating them together. Same thing for winver, however the output of that utility is more verbose and there
+were more events generated in total. For our purposes, both utillites appeared to be gathering the UBR from the same
+location.
+
+{% highlight PowerShell %}
+
+#Ver
+8:10:42.8680120 PM	cmd.exe	6220	RegQueryKey	HKLM	SUCCESS	Query: HandleTags, HandleTags: 0x0
+8:10:42.8680484 PM	cmd.exe	6220	RegOpenKey	HKLM\Software\Microsoft\Windows NT\CurrentVersion	SUCCESS	Desired Access: Maximum Allowed, Granted Access: All Access
+8:10:42.8680921 PM	cmd.exe	6220	RegQueryValue	HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\UBR	SUCCESS	Type: REG_DWORD, Length: 4, Data: 4037
+8:10:42.8681323 PM	cmd.exe	6220	RegCloseKey	HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion	SUCCESS	
+
+#Winver (omitting quite a bit of other events)
+8:13:27.2032402 PM	winver.exe	28800	RegQueryValue	HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\DisplayVersion	SUCCESS	Type: REG_SZ, Length: 10, Data: 23H2
+8:13:27.2032652 PM	winver.exe	28800	RegQueryValue	HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\CurrentBuild	SUCCESS	Type: REG_SZ, Length: 12, Data: 22631
+8:13:27.2033223 PM	winver.exe	28800	RegQueryValue	HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\UBR	SUCCESS	Type: REG_DWORD, Length: 4, Data: 4037
+
+
+{% endhighlight %}
+
+# In closing
+
+Ultimately, we followed the lead of winver.exe and ver, and gathered the information from the registry with something similar to this:
+
+{% highlight PowerShell %}
+
+(get-itempropertyValue 'HKLM:\Software\Microsoft\Windows NT\CurrentVersion' 'CurrentMajorVersionNumber','CurrentMinorVersionNumber','CurrentBuild','UBR') -join "." -as [Version]
+
+Major  Minor  Build  Revision
+-----  -----  -----  --------
+10     0      22631  4037
+
+{% endhighlight %}
